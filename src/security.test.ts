@@ -3,6 +3,8 @@ import {
   cardNameKey,
   normalizeCardName,
   normalizeInviteCode,
+  normalizePlayerName,
+  playerNameKey,
   privateMemberLabel,
   randomInviteCode,
   randomToken,
@@ -20,6 +22,19 @@ describe("card names", () => {
   it("normalizes harmless whitespace and makes stable keys", () => {
     expect(normalizeCardName("  Great   Olm ")).toBe("Great Olm");
     expect(cardNameKey("Great Olm")).toBe("great olm");
+  });
+});
+
+describe("private server player names", () => {
+  it("accepts OSRS display names and makes a stable matching key", () => {
+    expect(normalizePlayerName("  Sqwiglyy  ")).toBe("Sqwiglyy");
+    expect(normalizePlayerName("Iron_ Friend")).toBe("Iron_ Friend");
+    expect(playerNameKey("Iron_ Friend")).toBe("iron friend");
+  });
+
+  it("rejects names that cannot be RuneScape display names", () => {
+    expect(normalizePlayerName("this-name-is-far-too-long")).toBeNull();
+    expect(normalizePlayerName("<script>")).toBeNull();
   });
 });
 

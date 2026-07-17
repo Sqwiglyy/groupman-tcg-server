@@ -2,7 +2,7 @@
   "name": "groupman-tcg-server",
   "version": "0.1.0",
   "private": true,
-  "description": "Offline sync and group collection API for the Groupman TCG RuneLite plugin",
+  "description": "Private multiplayer collection and Top Trumps API for the Group TCG RuneLite plugin",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --local",
@@ -27,7 +27,7 @@
   "cloudflare": {
     "bindings": {
       "DB": {
-        "description": "D1 stores one private group's opaque member labels, hashed credentials, shared TCG unlocks, card provenance, and pack history."
+        "description": "D1 stores one private group's display names, collection modes, hashed credentials, TCG history, and Top Trumps events."
       }
     }
   }

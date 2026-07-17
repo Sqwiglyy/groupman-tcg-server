@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.0-rc.3 - 2026-07-17
+
+- Rename the service documentation to Group TCG API v4.
+- Add private-server RuneScape display names and per-member solo/shared modes.
+- Increase the private deployment limit from five to 50 approved memberships.
+- Add authenticated, participant-scoped Top Trumps challenges, consent,
+  server-side random draws, and result events.
+- Add migrations 0005 and 0006 plus matching privacy and upgrade guidance.
+
 ## v0.1.0-rc.2 - 2026-07-17
 
 - Require a private encrypted `SETUP_KEY` before an unclaimed Worker can create

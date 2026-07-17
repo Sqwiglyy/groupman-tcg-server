@@ -3,6 +3,8 @@ import {
   cardNameKey,
   normalizeCardName,
   normalizeInviteCode,
+  normalizePlayerName,
+  playerNameKey,
   privateMemberLabel,
   randomInviteCode,
   randomToken,
@@ -18,6 +20,9 @@ interface MemberRow {
   id: string;
   group_id: string;
   member_label: string;
+  player_name: string | null;
+  player_name_key: string | null;
+  collection_mode: "shared" | "solo";
   role: "owner" | "member";
   status: "pending" | "approved";
   revoked_at: number | null;
@@ -70,6 +75,8 @@ const INVITE_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_BODY_BYTES = 64 * 1024;
 const MIN_SETUP_KEY_LENGTH = 16;
 const MAX_SETUP_KEY_LENGTH = 256;
+const TOP_TRUMPS_CHALLENGE_MS = 60_000;
+const MAX_ACTIVE_MEMBERS = 50;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -80,7 +87,7 @@ export default {
         return json({ error: { code: error.code, message: error.message } }, error.status);
       }
       // Do not place request bodies, credentials, identifiers, or gameplay data in Worker logs.
-      console.error("Unhandled Groupman TCG API error");
+      console.error("Unhandled Group TCG API error");
       return json({ error: { code: "internal_error", message: "The server could not complete the request." } }, 500);
     }
   },
@@ -94,8 +101,8 @@ async function route(request: Request, env: Env): Promise<Response> {
     const database = await env.DB.prepare("SELECT 1 AS ok").first<{ ok: number }>();
     return json({
       status: database?.ok === 1 ? "ok" : "degraded",
-      service: "groupman-tcg-api",
-      version: 3,
+      service: "group-tcg-api",
+      version: 4,
       setupReady: validSetupKey(configuredSetupKey(env)),
     });
   }
@@ -161,6 +168,21 @@ async function route(request: Request, env: Env): Promise<Response> {
     return revokeMember(request, env, decodePath(memberMatch[1]), decodePath(memberMatch[2]));
   }
 
+  const challengeCollectionMatch = /^\/v1\/groups\/([^/]+)\/top-trumps\/challenges$/.exec(path);
+  if (request.method === "POST" && challengeCollectionMatch) {
+    return createTopTrumpsChallenge(request, env, decodePath(challengeCollectionMatch[1]));
+  }
+
+  const challengeResponseMatch = /^\/v1\/groups\/([^/]+)\/top-trumps\/challenges\/([^/]+)\/response$/.exec(path);
+  if (request.method === "POST" && challengeResponseMatch) {
+    return respondTopTrumpsChallenge(
+      request,
+      env,
+      decodePath(challengeResponseMatch[1]),
+      decodePath(challengeResponseMatch[2]),
+    );
+  }
+
   throw new ApiError(404, "not_found", "That API route does not exist.");
 }
 
@@ -168,7 +190,7 @@ async function createGroup(request: Request, env: Env): Promise<Response> {
   const claimed = await env.DB.prepare("SELECT group_id FROM instance_registration WHERE slot = 1")
     .first<{ group_id: string }>();
   if (claimed) {
-    throw new ApiError(409, "instance_claimed", "This private server already belongs to a Groupman TCG group.");
+    throw new ApiError(409, "instance_claimed", "This private server already belongs to a Group TCG group.");
   }
 
   const expectedSetupKey = configuredSetupKey(env);
@@ -181,7 +203,9 @@ async function createGroup(request: Request, env: Env): Promise<Response> {
     throw new ApiError(403, "invalid_setup_key", "The private Worker setup key is incorrect.");
   }
 
-  await readJson(request);
+  const body = await readJson(request);
+  const playerName = playerNameField(body.playerName);
+  const collectionMode = collectionModeField(body.collectionMode);
   const groupId = crypto.randomUUID();
   const ownerId = crypto.randomUUID();
   const ownerLabel = privateMemberLabel("owner", ownerId);
@@ -197,18 +221,20 @@ async function createGroup(request: Request, env: Env): Promise<Response> {
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).bind(groupId, "Private Group", ownerId, await sha256(inviteCode), inviteExpiresAt, now, now),
     env.DB.prepare(
-      `INSERT INTO members
-       (id, group_id, member_key, member_label, role, status, token_hash,
-        created_at, approved_at, last_seen_at)
-       VALUES (?, ?, ?, ?, 'owner', 'approved', ?, ?, ?, ?)`,
-    ).bind(ownerId, groupId, `private_${ownerId}`, ownerLabel, await sha256(token), now, now, now),
+       `INSERT INTO members
+       (id, group_id, member_key, member_label, player_name, player_name_key, collection_mode,
+        role, status, token_hash, created_at, approved_at, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'owner', 'approved', ?, ?, ?, ?)`,
+    ).bind(ownerId, groupId, `private_${ownerId}`, ownerLabel, playerName,
+      playerNameKey(playerName), collectionMode, await sha256(token), now, now, now),
     env.DB.prepare("INSERT INTO instance_registration (slot, group_id) VALUES (1, ?)").bind(groupId),
   ]);
 
   return json(
     {
       group: { id: groupId, collectionVersion: 0 },
-      member: { id: ownerId, label: ownerLabel, role: "owner", status: "approved", token },
+      member: { id: ownerId, label: ownerLabel, playerName, collectionMode,
+        role: "owner", status: "approved", token },
       invite: { code: inviteCode, expiresAt: inviteExpiresAt },
     },
     201,
@@ -226,6 +252,8 @@ function validSetupKey(value: string): boolean {
 async function joinGroup(request: Request, env: Env): Promise<Response> {
   const body = await readJson(request);
   const groupId = stringField(body.groupId, "groupId", 1, 64);
+  const playerName = playerNameField(body.playerName);
+  const collectionMode = collectionModeField(body.collectionMode);
   const inviteCode = normalizeInviteCode(body.inviteCode);
   if (!inviteCode) {
     throw new ApiError(400, "invalid_invite", "inviteCode is not a valid group invite code.");
@@ -241,8 +269,15 @@ async function joinGroup(request: Request, env: Env): Promise<Response> {
   )
     .bind(groupId)
     .first<{ count: number }>();
-  if ((active?.count ?? 0) >= 5) {
-    throw new ApiError(409, "group_full", "This private group already has five active memberships.");
+  if ((active?.count ?? 0) >= MAX_ACTIVE_MEMBERS) {
+    throw new ApiError(409, "group_full", `This private server already has ${MAX_ACTIVE_MEMBERS} active memberships.`);
+  }
+
+  const duplicatePlayer = await env.DB.prepare(
+    "SELECT id FROM members WHERE group_id = ? AND player_name_key = ? AND revoked_at IS NULL",
+  ).bind(groupId, playerNameKey(playerName)).first<{ id: string }>();
+  if (duplicatePlayer) {
+    throw new ApiError(409, "player_already_joined", "That RuneScape name is already an active server member.");
   }
 
   const memberId = crypto.randomUUID();
@@ -253,20 +288,24 @@ async function joinGroup(request: Request, env: Env): Promise<Response> {
 
   await env.DB.prepare(
     `INSERT INTO members
-     (id, group_id, member_key, member_label, role, status, token_hash, created_at, last_seen_at)
-     VALUES (?, ?, ?, ?, 'member', 'pending', ?, ?, ?)`,
+     (id, group_id, member_key, member_label, player_name, player_name_key, collection_mode,
+      role, status, token_hash, created_at, last_seen_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'member', 'pending', ?, ?, ?)`,
   )
-    .bind(memberId, groupId, `private_${memberId}`, memberLabel, tokenHash, now, now)
+    .bind(memberId, groupId, `private_${memberId}`, memberLabel, playerName,
+      playerNameKey(playerName), collectionMode, tokenHash, now, now)
     .run();
 
-  return json({ member: { id: memberId, groupId, label: memberLabel, role: "member", status: "pending", token } }, 202);
+  return json({ member: { id: memberId, groupId, label: memberLabel, playerName,
+    collectionMode, role: "member", status: "pending", token } }, 202);
 }
 
 async function getGroup(request: Request, env: Env, groupId: string): Promise<Response> {
   const member = await authenticate(request, env, groupId, true);
   const group = await getGroupRow(env, groupId);
   const members = await env.DB.prepare(
-    `SELECT id, member_label, role, status, created_at, approved_at, revoked_at, last_seen_at
+    `SELECT id, member_label, player_name, collection_mode, role, status,
+            created_at, approved_at, revoked_at, last_seen_at
      FROM members WHERE group_id = ? ORDER BY role DESC, id`,
   )
     .bind(groupId)
@@ -278,6 +317,8 @@ async function getGroup(request: Request, env: Env, groupId: string): Promise<Re
     members: members.results.map((row) => ({
       id: row.id,
       label: row.member_label,
+      playerName: row.player_name,
+      collectionMode: row.collection_mode,
       role: row.role,
       status: row.status,
       revoked: row.revoked_at !== null,
@@ -422,6 +463,7 @@ async function uploadCollection(request: Request, env: Env, groupId: string): Pr
 async function uploadMemberCollection(request: Request, env: Env, groupId: string): Promise<Response> {
   const member = await authenticate(request, env, groupId, true);
   const body = await readJson(request);
+  const collectionMode = collectionModeField(body.collectionMode);
   const snapshotId = stringField(body.snapshotId, "snapshotId", 8, 80);
   if (!/^[A-Za-z0-9_-]+$/.test(snapshotId)) {
     throw new ApiError(400, "invalid_snapshot_id", "snapshotId may contain only letters, numbers, underscores and hyphens.");
@@ -497,6 +539,10 @@ async function uploadMemberCollection(request: Request, env: Env, groupId: strin
     env.DB.prepare("UPDATE groups SET collection_version = collection_version + 1, updated_at = ? WHERE id = ?")
       .bind(now, groupId),
   );
+  statements.push(
+    env.DB.prepare("UPDATE members SET collection_mode = ? WHERE id = ?")
+      .bind(collectionMode, member.id),
+  );
   await env.DB.batch(statements);
 
   const counts = await env.DB.prepare(
@@ -517,7 +563,7 @@ async function uploadMemberCollection(request: Request, env: Env, groupId: strin
 async function getMemberCollections(request: Request, env: Env, groupId: string): Promise<Response> {
   await authenticate(request, env, groupId, true);
   const result = await env.DB.prepare(
-    `SELECT m.id, m.member_label,
+    `SELECT m.id, m.member_label, m.player_name, m.collection_mode,
             COUNT(DISTINCT i.card_name_key) AS cards,
             COUNT(i.source_instance_id) AS copies,
             COALESCE(SUM(i.foil), 0) AS foils,
@@ -526,7 +572,7 @@ async function getMemberCollections(request: Request, env: Env, groupId: string)
      FROM members m
      LEFT JOIN member_card_instances i ON i.group_id = m.group_id AND i.member_id = m.id
      WHERE m.group_id = ? AND m.status = 'approved' AND m.revoked_at IS NULL
-     GROUP BY m.id, m.member_label ORDER BY m.id`,
+     GROUP BY m.id, m.member_label, m.player_name, m.collection_mode ORDER BY m.id`,
   )
     .bind(groupId)
     .all();
@@ -534,6 +580,8 @@ async function getMemberCollections(request: Request, env: Env, groupId: string)
     members: result.results.map((row) => ({
       id: row.id,
       label: row.member_label,
+      playerName: row.player_name,
+      collectionMode: row.collection_mode,
       cards: row.cards,
       copies: row.copies,
       foils: row.foils,
@@ -613,8 +661,9 @@ async function getCardProvenance(request: Request, env: Env, groupId: string, ur
 }
 
 async function syncGroup(request: Request, env: Env, groupId: string, url: URL): Promise<Response> {
-  await authenticate(request, env, groupId, true);
+  const member = await authenticate(request, env, groupId, true);
   const after = queryInteger(url, "after", 0, Number.MAX_SAFE_INTEGER, 0);
+  const topTrumpsAfter = queryInteger(url, "topTrumpsAfter", 0, Number.MAX_SAFE_INTEGER, 0);
   const clientCollectionVersion = queryInteger(url, "collectionVersion", 0, Number.MAX_SAFE_INTEGER, 0);
   const limit = queryInteger(url, "limit", 1, 100, 100);
   const group = await getGroupRow(env, groupId);
@@ -647,11 +696,42 @@ async function syncGroup(request: Request, env: Env, groupId: string, url: URL):
     unlocks = unlockResult.results.map((row) => row.card_name);
   }
 
+  const duelResult = await env.DB.prepare(
+    `SELECT e.seq, e.challenge_id, e.event_type, e.challenger_card, e.challenged_card, e.created_at,
+            c.expires_at,
+            challenger.id AS challenger_id, challenger.member_label AS challenger_label,
+            challenger.player_name AS challenger_player_name,
+            challenged.id AS challenged_id, challenged.member_label AS challenged_label,
+            challenged.player_name AS challenged_player_name
+     FROM top_trumps_events e
+     JOIN top_trumps_challenges c ON c.id = e.challenge_id
+     JOIN members challenger ON challenger.id = e.challenger_member_id
+     JOIN members challenged ON challenged.id = e.challenged_member_id
+     WHERE e.group_id = ? AND e.seq > ?
+       AND (e.challenger_member_id = ? OR e.challenged_member_id = ?)
+     ORDER BY e.seq LIMIT 100`,
+  ).bind(groupId, topTrumpsAfter, member.id, member.id).all();
+  const topTrumpsEvents = duelResult.results.map((row) => ({
+    sequence: row.seq,
+    challengeId: row.challenge_id,
+    type: row.event_type,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    challenger: { id: row.challenger_id, label: row.challenger_label, playerName: row.challenger_player_name },
+    challenged: { id: row.challenged_id, label: row.challenged_label, playerName: row.challenged_player_name },
+    challengerCard: row.challenger_card,
+    challengedCard: row.challenged_card,
+  }));
+
   return json({
     serverTime: Date.now(),
     nextCursor: events.length > 0 ? events[events.length - 1]?.sequence : after,
     hasMore,
     events,
+    topTrumpsNextCursor: topTrumpsEvents.length > 0
+      ? topTrumpsEvents[topTrumpsEvents.length - 1]?.sequence
+      : topTrumpsAfter,
+    topTrumpsEvents,
     collection: {
       version: group.collection_version,
       changed: clientCollectionVersion !== group.collection_version,
@@ -660,13 +740,166 @@ async function syncGroup(request: Request, env: Env, groupId: string, url: URL):
   });
 }
 
+async function createTopTrumpsChallenge(request: Request, env: Env, groupId: string): Promise<Response> {
+  const challenger = await authenticate(request, env, groupId, true);
+  const body = await readJson(request);
+  const targetMemberId = stringField(body.targetMemberId, "targetMemberId", 8, 64);
+  if (targetMemberId === challenger.id) {
+    throw new ApiError(400, "self_challenge", "You cannot challenge yourself.");
+  }
+  const challenged = await env.DB.prepare(
+    `SELECT m.id, m.group_id, m.member_label, m.player_name, m.player_name_key,
+            m.collection_mode, m.role, m.status, m.revoked_at, m.last_seen_at,
+            g.owner_member_id
+     FROM members m JOIN groups g ON g.id = m.group_id
+     WHERE m.id = ? AND m.group_id = ? AND m.status = 'approved' AND m.revoked_at IS NULL`,
+  ).bind(targetMemberId, groupId).first<MemberRow>();
+  if (!challenged) {
+    throw new ApiError(404, "member_not_found", "That approved server member does not exist.");
+  }
+  if (!(await hasTopTrumpsCards(env, groupId, challenger))
+    || !(await hasTopTrumpsCards(env, groupId, challenged))) {
+    throw new ApiError(409, "insufficient_cards", "Both players need at least one card in their selected collection mode.");
+  }
+
+  const now = Date.now();
+  await env.DB.prepare(
+    "UPDATE top_trumps_challenges SET status = 'expired' WHERE group_id = ? AND status = 'pending' AND expires_at < ?",
+  ).bind(groupId, now).run();
+  const existing = await env.DB.prepare(
+    `SELECT id FROM top_trumps_challenges
+     WHERE group_id = ? AND challenger_member_id = ? AND status = 'pending' AND expires_at >= ?`,
+  ).bind(groupId, challenger.id, now).first<{ id: string }>();
+  if (existing) {
+    throw new ApiError(409, "challenge_pending", "Wait for your current Top Trumps challenge to finish.");
+  }
+
+  const challengeId = crypto.randomUUID();
+  const expiresAt = now + TOP_TRUMPS_CHALLENGE_MS;
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO top_trumps_challenges
+       (id, group_id, challenger_member_id, challenged_member_id, status, expires_at, created_at)
+       VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
+    ).bind(challengeId, groupId, challenger.id, challenged.id, expiresAt, now),
+    env.DB.prepare(
+      `INSERT INTO top_trumps_events
+       (group_id, challenge_id, event_type, challenger_member_id, challenged_member_id, created_at)
+       VALUES (?, ?, 'challenge', ?, ?, ?)`,
+    ).bind(groupId, challengeId, challenger.id, challenged.id, now),
+  ]);
+  return json({ challengeId, expiresAt }, 201);
+}
+
+async function respondTopTrumpsChallenge(
+  request: Request,
+  env: Env,
+  groupId: string,
+  challengeId: string,
+): Promise<Response> {
+  const challenged = await authenticate(request, env, groupId, true);
+  const body = await readJson(request);
+  if (typeof body.accepted !== "boolean") {
+    throw new ApiError(400, "invalid_accepted", "accepted must be a boolean.");
+  }
+  const challenge = await env.DB.prepare(
+    `SELECT id, challenger_member_id, challenged_member_id, status, expires_at
+     FROM top_trumps_challenges WHERE id = ? AND group_id = ?`,
+  ).bind(challengeId, groupId).first<{
+    id: string;
+    challenger_member_id: string;
+    challenged_member_id: string;
+    status: string;
+    expires_at: number;
+  }>();
+  if (!challenge || challenge.challenged_member_id !== challenged.id) {
+    throw new ApiError(404, "challenge_not_found", "That Top Trumps challenge does not exist for this member.");
+  }
+  if (challenge.status !== "pending") {
+    throw new ApiError(409, "challenge_finished", "That Top Trumps challenge has already finished.");
+  }
+  const now = Date.now();
+  if (challenge.expires_at < now) {
+    await env.DB.prepare("UPDATE top_trumps_challenges SET status = 'expired' WHERE id = ? AND status = 'pending'")
+      .bind(challengeId).run();
+    throw new ApiError(410, "challenge_expired", "That Top Trumps challenge has expired.");
+  }
+
+  if (!body.accepted) {
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE top_trumps_challenges SET status = 'declined', responded_at = ? WHERE id = ? AND status = 'pending'",
+      ).bind(now, challengeId),
+      env.DB.prepare(
+        `INSERT INTO top_trumps_events
+         (group_id, challenge_id, event_type, challenger_member_id, challenged_member_id, created_at)
+         VALUES (?, ?, 'declined', ?, ?, ?)`,
+      ).bind(groupId, challengeId, challenge.challenger_member_id, challenge.challenged_member_id, now),
+    ]);
+    return json({ challengeId, status: "declined" });
+  }
+
+  const challenger = await getApprovedMember(env, groupId, challenge.challenger_member_id);
+  if (!challenger) {
+    throw new ApiError(409, "challenger_unavailable", "The challenger is no longer an approved server member.");
+  }
+  const challengerCard = await drawTopTrumpsCard(env, groupId, challenger);
+  const challengedCard = await drawTopTrumpsCard(env, groupId, challenged);
+  if (!challengerCard || !challengedCard) {
+    throw new ApiError(409, "insufficient_cards", "Both players need at least one card in their selected collection mode.");
+  }
+
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE top_trumps_challenges SET status = 'accepted', responded_at = ? WHERE id = ? AND status = 'pending'",
+    ).bind(now, challengeId),
+    env.DB.prepare(
+      `INSERT INTO top_trumps_events
+       (group_id, challenge_id, event_type, challenger_member_id, challenged_member_id,
+        challenger_card, challenged_card, created_at)
+       VALUES (?, ?, 'result', ?, ?, ?, ?, ?)`,
+    ).bind(groupId, challengeId, challenge.challenger_member_id, challenge.challenged_member_id,
+      challengerCard, challengedCard, now),
+  ]);
+  return json({ challengeId, status: "accepted", challengerCard, challengedCard });
+}
+
+async function getApprovedMember(env: Env, groupId: string, memberId: string): Promise<MemberRow | null> {
+  return env.DB.prepare(
+    `SELECT m.id, m.group_id, m.member_label, m.player_name, m.player_name_key,
+            m.collection_mode, m.role, m.status, m.revoked_at, m.last_seen_at,
+            g.owner_member_id
+     FROM members m JOIN groups g ON g.id = m.group_id
+     WHERE m.id = ? AND m.group_id = ? AND m.status = 'approved' AND m.revoked_at IS NULL`,
+  ).bind(memberId, groupId).first<MemberRow>();
+}
+
+async function hasTopTrumpsCards(env: Env, groupId: string, member: MemberRow): Promise<boolean> {
+  return (await drawTopTrumpsCard(env, groupId, member)) !== null;
+}
+
+async function drawTopTrumpsCard(env: Env, groupId: string, member: MemberRow): Promise<string | null> {
+  if (member.collection_mode === "solo") {
+    const row = await env.DB.prepare(
+      `SELECT card_name FROM member_card_instances
+       WHERE group_id = ? AND member_id = ? GROUP BY card_name_key ORDER BY RANDOM() LIMIT 1`,
+    ).bind(groupId, member.id).first<{ card_name: string }>();
+    return row?.card_name ?? null;
+  }
+  const row = await env.DB.prepare(
+    "SELECT card_name FROM group_unlocks WHERE group_id = ? ORDER BY RANDOM() LIMIT 1",
+  ).bind(groupId).first<{ card_name: string }>();
+  return row?.card_name ?? null;
+}
+
 async function authenticate(request: Request, env: Env, groupId: string, requireApproved: boolean): Promise<MemberRow> {
   const token = bearerToken(request);
   if (!token || token.length < 32 || token.length > 128) {
     throw new ApiError(401, "unauthorized", "A valid member bearer token is required.");
   }
   const member = await env.DB.prepare(
-    `SELECT m.id, m.group_id, m.member_label, m.role, m.status, m.revoked_at, m.last_seen_at,
+    `SELECT m.id, m.group_id, m.member_label, m.player_name, m.player_name_key,
+            m.collection_mode, m.role, m.status, m.revoked_at, m.last_seen_at,
             g.owner_member_id
      FROM members m JOIN groups g ON g.id = m.group_id
      WHERE m.token_hash = ? AND m.group_id = ? AND m.revoked_at IS NULL`,
@@ -794,6 +1027,21 @@ function stringField(value: unknown, field: string, minLength: number, maxLength
   return normalized;
 }
 
+function playerNameField(value: unknown): string {
+  const normalized = normalizePlayerName(value);
+  if (!normalized) {
+    throw new ApiError(400, "invalid_player_name", "playerName must contain 1 to 12 valid RuneScape-name characters.");
+  }
+  return normalized;
+}
+
+function collectionModeField(value: unknown): "shared" | "solo" {
+  if (value !== "shared" && value !== "solo") {
+    throw new ApiError(400, "invalid_collection_mode", "collectionMode must be shared or solo.");
+  }
+  return value;
+}
+
 function integerField(value: unknown, field: string, minimum: number, maximum: number): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum || value > maximum) {
     throw new ApiError(400, "invalid_field", `${field} must be an integer between ${minimum} and ${maximum}.`);
@@ -829,6 +1077,8 @@ function publicMember(member: MemberRow) {
     id: member.id,
     groupId: member.group_id,
     label: member.member_label,
+    playerName: member.player_name,
+    collectionMode: member.collection_mode,
     role: member.role,
     status: member.status,
   };

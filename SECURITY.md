@@ -1,6 +1,6 @@
 # Security and private reports
 
-Do not publish Groupman setup keys, group IDs, invite codes, bearer tokens,
+Do not publish Group TCG setup keys, group IDs, invite codes, bearer tokens,
 Worker URLs, D1 database IDs, database exports, or logs containing request data
 in an issue.
 

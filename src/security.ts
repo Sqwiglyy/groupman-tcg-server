@@ -20,6 +20,18 @@ export function cardNameKey(name: string): string {
   return name.toLocaleLowerCase("en-US");
 }
 
+export function normalizePlayerName(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const name = value.replace(/\u00a0/g, " ").trim().replace(/\s+/g, " ");
+  return name.length >= 1 && name.length <= 12 && /^[A-Za-z0-9 _-]+$/.test(name) ? name : null;
+}
+
+export function playerNameKey(name: string): string {
+  return name.toLowerCase().replace(/[_\-\s]+/g, " ").trim();
+}
+
 export function randomToken(byteLength = 32): string {
   const bytes = new Uint8Array(byteLength);
   crypto.getRandomValues(bytes);
