@@ -84,7 +84,7 @@ profile and does not display it.
 
 ### Manual deployment
 
-Requires a Cloudflare account, Node.js 20 or newer, and pnpm:
+Requires a Cloudflare account, Node.js 22 or newer, and pnpm:
 
 ```powershell
 pnpm install

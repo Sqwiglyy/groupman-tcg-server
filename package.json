@@ -22,7 +22,7 @@
     "wrangler": "4.112.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "cloudflare": {
     "bindings": {
