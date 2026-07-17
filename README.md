@@ -4,6 +4,8 @@ Cloudflare Worker and D1 database used by the Groupman TCG RuneLite plugin for
 durable group unlocks and offline pack history. RuneLite Party can still carry
 instant reveals; this API makes every approved member converge after reconnecting.
 
+Production API: `https://groupman-tcg-api.sqwiglyy.workers.dev`
+
 ## Security model
 
 - A group owner creates a group and receives an owner token plus a 30-day invite.
