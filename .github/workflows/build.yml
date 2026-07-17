@@ -1,0 +1,41 @@
+name: Build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+          cache: pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Reject deployment-specific values
+        shell: bash
+        run: |
+          if git grep -n -E 'https://groupman-tcg-api\.[[:alnum:]-]+\.workers\.dev'; then
+            echo 'Deployment-specific Worker URL found in tracked files.' >&2
+            exit 1
+          fi
+          if git grep -n -E 'database_id.*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' -- 'wrangler*.jsonc'; then
+            echo 'Deployment-specific value found in tracked files.' >&2
+            exit 1
+          fi
+      - name: Typecheck and test
+        run: pnpm check
+      - name: Apply fresh local migrations
+        run: pnpm wrangler d1 migrations apply DB --local
+      - name: Verify deploy bundle
+        run: pnpm wrangler deploy --dry-run --outdir dist
