@@ -42,6 +42,14 @@ interface CardPull {
   isNew: boolean;
 }
 
+interface MemberCardInstanceInput {
+  sourceInstanceId: string;
+  cardName: string;
+  foil: boolean;
+  pulledBy: string;
+  pulledAt: number;
+}
+
 class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -110,6 +118,26 @@ async function route(request: Request, env: Env): Promise<Response> {
   const collectionMatch = /^\/v1\/groups\/([^/]+)\/collection$/.exec(path);
   if (request.method === "POST" && collectionMatch) {
     return uploadCollection(request, env, decodePath(collectionMatch[1]));
+  }
+
+  const memberCollectionUploadMatch = /^\/v1\/groups\/([^/]+)\/member-collection$/.exec(path);
+  if (request.method === "POST" && memberCollectionUploadMatch) {
+    return uploadMemberCollection(request, env, decodePath(memberCollectionUploadMatch[1]));
+  }
+
+  const memberCollectionsMatch = /^\/v1\/groups\/([^/]+)\/member-collections$/.exec(path);
+  if (request.method === "GET" && memberCollectionsMatch) {
+    return getMemberCollections(request, env, decodePath(memberCollectionsMatch[1]));
+  }
+
+  const memberCardsMatch = /^\/v1\/groups\/([^/]+)\/members\/([^/]+)\/collection$/.exec(path);
+  if (request.method === "GET" && memberCardsMatch) {
+    return getMemberCollection(request, env, decodePath(memberCardsMatch[1]), decodePath(memberCardsMatch[2]), url);
+  }
+
+  const provenanceMatch = /^\/v1\/groups\/([^/]+)\/provenance$/.exec(path);
+  if (request.method === "GET" && provenanceMatch) {
+    return getCardProvenance(request, env, decodePath(provenanceMatch[1]), url);
   }
 
   const rotateMatch = /^\/v1\/groups\/([^/]+)\/invite$/.exec(path);
@@ -367,6 +395,203 @@ async function uploadCollection(request: Request, env: Env, groupId: string): Pr
   return json({ accepted: names.length, collectionVersion: group.collection_version });
 }
 
+async function uploadMemberCollection(request: Request, env: Env, groupId: string): Promise<Response> {
+  const member = await authenticate(request, env, groupId, true);
+  const body = await readJson(request);
+  const snapshotId = stringField(body.snapshotId, "snapshotId", 8, 80);
+  if (!/^[A-Za-z0-9_-]+$/.test(snapshotId)) {
+    throw new ApiError(400, "invalid_snapshot_id", "snapshotId may contain only letters, numbers, underscores and hyphens.");
+  }
+  if (!Array.isArray(body.instances) || body.instances.length > 200) {
+    throw new ApiError(400, "invalid_instances", "instances must be an array containing no more than 200 card copies.");
+  }
+  if (typeof body.complete !== "boolean") {
+    throw new ApiError(400, "invalid_complete", "complete must indicate whether this is the final snapshot chunk.");
+  }
+
+  const instances = body.instances.map(parseMemberCardInstance);
+  const uniqueInstances = [...new Map(instances.map((instance) => [instance.sourceInstanceId, instance])).values()];
+  const now = Date.now();
+  const statements: D1PreparedStatement[] = [];
+  for (let offset = 0; offset < uniqueInstances.length; offset += 9) {
+    const chunk = uniqueInstances.slice(offset, offset + 9);
+    const placeholders = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+    const bindings = chunk.flatMap((instance) => [
+      groupId,
+      member.id,
+      instance.sourceInstanceId,
+      cardNameKey(instance.cardName),
+      instance.cardName,
+      instance.foil ? 1 : 0,
+      instance.pulledBy,
+      instance.pulledAt,
+      acquisitionKind(instance.pulledBy, instance.pulledAt),
+      snapshotId,
+      now,
+    ]);
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO member_card_instances
+         (group_id, member_id, source_instance_id, card_name_key, card_name, foil,
+          pulled_by, pulled_at, acquisition_kind, snapshot_id, updated_at)
+         VALUES ${placeholders}
+         ON CONFLICT(group_id, member_id, source_instance_id) DO UPDATE SET
+           card_name_key = excluded.card_name_key,
+           card_name = excluded.card_name,
+           foil = excluded.foil,
+           pulled_by = excluded.pulled_by,
+           pulled_at = excluded.pulled_at,
+           acquisition_kind = excluded.acquisition_kind,
+           snapshot_id = excluded.snapshot_id,
+           updated_at = excluded.updated_at`,
+      ).bind(...bindings),
+    );
+  }
+
+  const uniqueCards = [...new Map(uniqueInstances.map((instance) => [
+    cardNameKey(instance.cardName),
+    instance.cardName,
+  ])).values()];
+  for (let offset = 0; offset < uniqueCards.length; offset += 18) {
+    const chunk = uniqueCards.slice(offset, offset + 18);
+    const placeholders = chunk.map(() => "(?, ?, ?, ?, ?)").join(", ");
+    const bindings = chunk.flatMap((name) => [groupId, cardNameKey(name), name, member.id, now]);
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO group_unlocks
+         (group_id, card_name_key, card_name, first_member_id, first_seen_at)
+         VALUES ${placeholders} ON CONFLICT(group_id, card_name_key) DO NOTHING`,
+      ).bind(...bindings),
+    );
+  }
+  if (body.complete) {
+    statements.push(
+      env.DB.prepare(
+        "DELETE FROM member_card_instances WHERE group_id = ? AND member_id = ? AND snapshot_id <> ?",
+      ).bind(groupId, member.id, snapshotId),
+    );
+  }
+  statements.push(
+    env.DB.prepare("UPDATE groups SET collection_version = collection_version + 1, updated_at = ? WHERE id = ?")
+      .bind(now, groupId),
+  );
+  await env.DB.batch(statements);
+
+  const counts = await env.DB.prepare(
+    `SELECT COUNT(*) AS copies, COUNT(DISTINCT card_name_key) AS cards,
+            COALESCE(SUM(foil), 0) AS foils
+     FROM member_card_instances WHERE group_id = ? AND member_id = ?`,
+  )
+    .bind(groupId, member.id)
+    .first<{ copies: number; cards: number; foils: number }>();
+  return json({
+    snapshotId,
+    accepted: uniqueInstances.length,
+    complete: body.complete,
+    collection: { cards: counts?.cards ?? 0, copies: counts?.copies ?? 0, foils: counts?.foils ?? 0 },
+  });
+}
+
+async function getMemberCollections(request: Request, env: Env, groupId: string): Promise<Response> {
+  await authenticate(request, env, groupId, true);
+  const result = await env.DB.prepare(
+    `SELECT m.id, m.rsn_display,
+            COUNT(DISTINCT i.card_name_key) AS cards,
+            COUNT(i.source_instance_id) AS copies,
+            COALESCE(SUM(i.foil), 0) AS foils,
+            MIN(NULLIF(i.pulled_at, 0)) AS first_pulled_at,
+            MAX(NULLIF(i.pulled_at, 0)) AS last_pulled_at
+     FROM members m
+     LEFT JOIN member_card_instances i ON i.group_id = m.group_id AND i.member_id = m.id
+     WHERE m.group_id = ? AND m.status = 'approved' AND m.revoked_at IS NULL
+     GROUP BY m.id, m.rsn_display ORDER BY m.rsn_key`,
+  )
+    .bind(groupId)
+    .all();
+  return json({
+    members: result.results.map((row) => ({
+      id: row.id,
+      rsn: row.rsn_display,
+      cards: row.cards,
+      copies: row.copies,
+      foils: row.foils,
+      firstPulledAt: row.first_pulled_at,
+      lastPulledAt: row.last_pulled_at,
+    })),
+  });
+}
+
+async function getMemberCollection(
+  request: Request,
+  env: Env,
+  groupId: string,
+  memberId: string,
+  url: URL,
+): Promise<Response> {
+  await authenticate(request, env, groupId, true);
+  const limit = queryInteger(url, "limit", 1, 200, 100);
+  const offset = queryInteger(url, "offset", 0, 100_000, 0);
+  const owner = await env.DB.prepare(
+    "SELECT id, rsn_display FROM members WHERE id = ? AND group_id = ? AND status = 'approved' AND revoked_at IS NULL",
+  )
+    .bind(memberId, groupId)
+    .first<{ id: string; rsn_display: string }>();
+  if (!owner) {
+    throw new ApiError(404, "member_not_found", "That approved group member does not exist.");
+  }
+  const result = await env.DB.prepare(
+    `SELECT source_instance_id, card_name, foil, pulled_by, pulled_at, acquisition_kind
+     FROM member_card_instances WHERE group_id = ? AND member_id = ?
+     ORDER BY card_name_key, pulled_at, source_instance_id LIMIT ? OFFSET ?`,
+  )
+    .bind(groupId, memberId, limit + 1, offset)
+    .all();
+  const rows = result.results.slice(0, limit);
+  return json({
+    member: { id: owner.id, rsn: owner.rsn_display },
+    offset,
+    nextOffset: offset + rows.length,
+    hasMore: result.results.length > limit,
+    instances: rows.map((row) => ({
+      sourceInstanceId: row.source_instance_id,
+      cardName: row.card_name,
+      foil: row.foil === 1,
+      pulledBy: displayPulledBy(String(row.pulled_by)),
+      pulledAt: row.pulled_at,
+      acquisitionKind: row.acquisition_kind,
+    })),
+  });
+}
+
+async function getCardProvenance(request: Request, env: Env, groupId: string, url: URL): Promise<Response> {
+  await authenticate(request, env, groupId, true);
+  const cardName = normalizeCardName(url.searchParams.get("cardName"));
+  if (!cardName) {
+    throw new ApiError(400, "invalid_card_name", "cardName is required.");
+  }
+  const result = await env.DB.prepare(
+    `SELECT i.source_instance_id, i.card_name, i.foil, i.pulled_by, i.pulled_at,
+            i.acquisition_kind, m.id AS member_id, m.rsn_display
+     FROM member_card_instances i JOIN members m ON m.id = i.member_id
+     WHERE i.group_id = ? AND i.card_name_key = ? AND m.revoked_at IS NULL
+     ORDER BY i.pulled_at, m.rsn_key, i.source_instance_id`,
+  )
+    .bind(groupId, cardNameKey(cardName))
+    .all();
+  return json({
+    cardName,
+    currentCopies: result.results.length,
+    owners: result.results.map((row) => ({
+      member: { id: row.member_id, rsn: row.rsn_display },
+      sourceInstanceId: row.source_instance_id,
+      foil: row.foil === 1,
+      pulledBy: displayPulledBy(String(row.pulled_by)),
+      pulledAt: row.pulled_at,
+      acquisitionKind: row.acquisition_kind,
+    })),
+  });
+}
+
 async function syncGroup(request: Request, env: Env, groupId: string, url: URL): Promise<Response> {
   await authenticate(request, env, groupId, true);
   const after = queryInteger(url, "after", 0, Number.MAX_SAFE_INTEGER, 0);
@@ -470,6 +695,44 @@ function parseCards(value: unknown): CardPull[] {
     }
     return { name, foil: entry.foil, isNew: entry.isNew };
   });
+}
+
+function parseMemberCardInstance(value: unknown): MemberCardInstanceInput {
+  if (!isObject(value)) {
+    throw new ApiError(400, "invalid_instance", "Each collection instance must be an object.");
+  }
+  const sourceInstanceId = stringField(value.sourceInstanceId, "sourceInstanceId", 1, 100);
+  if (!/^[A-Za-z0-9_-]+$/.test(sourceInstanceId)) {
+    throw new ApiError(
+      400,
+      "invalid_instance_id",
+      "sourceInstanceId may contain only letters, numbers, underscores and hyphens.",
+    );
+  }
+  const cardName = normalizeCardName(value.cardName);
+  if (!cardName) {
+    throw new ApiError(400, "invalid_card_name", "Every card name must contain between 1 and 120 characters.");
+  }
+  if (typeof value.foil !== "boolean") {
+    throw new ApiError(400, "invalid_foil", "foil must be a boolean.");
+  }
+  const pulledBy = typeof value.pulledBy === "string" ? value.pulledBy.trim() : "";
+  if (pulledBy.length > 48 || /[\u0000-\u001f\u007f]/.test(pulledBy)) {
+    throw new ApiError(400, "invalid_pulled_by", "pulledBy must be no longer than 48 printable characters.");
+  }
+  const pulledAt = integerField(value.pulledAt, "pulledAt", 0, Date.now() + 10 * 60 * 1000);
+  return { sourceInstanceId, cardName, foil: value.foil, pulledBy, pulledAt };
+}
+
+function acquisitionKind(pulledBy: string, pulledAt: number): "debug" | "pack_or_trade" | "unknown" {
+  if (pulledBy.toUpperCase().startsWith("DEBUG_")) {
+    return "debug";
+  }
+  return pulledAt > 0 ? "pack_or_trade" : "unknown";
+}
+
+function displayPulledBy(pulledBy: string): string {
+  return pulledBy.toUpperCase().startsWith("DEBUG_") ? `Debug_${pulledBy.slice(6)}` : pulledBy;
 }
 
 function uniqueCards(cards: CardPull[]): CardPull[] {
@@ -580,4 +843,3 @@ function isObject(value: unknown): value is Record<string, unknown> {
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: JSON_HEADERS });
 }
-

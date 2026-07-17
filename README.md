@@ -115,6 +115,42 @@ makes retries safe and does not create another pack event.
 
 Send no more than 500 names per request. The collection is grow-only.
 
+### Upload an individual collection with provenance
+
+`POST /v1/groups/{groupId}/member-collection`
+
+```json
+{
+  "snapshotId": "client-snapshot-20260717",
+  "complete": true,
+  "instances": [
+    {
+      "sourceInstanceId": "OSRS-TCG-INSTANCE-ID",
+      "cardName": "Great Olm",
+      "foil": true,
+      "pulledBy": "Sqwiglyy",
+      "pulledAt": 1784296800000
+    }
+  ]
+}
+```
+
+Send at most 200 instances per request. Use one `snapshotId` across all chunks
+and set `complete` only on the last chunk. Completing a snapshot removes card
+instances no longer owned by that member; it never removes the card from the
+shared grow-only unlock collection.
+
+The OSRS TCG data records the current owner separately from the original puller.
+It does not record a booster type or in-game activity. Consequently,
+`acquisitionKind` distinguishes normal pack-or-trade history, debug grants and
+unknown legacy data, but cannot reliably distinguish a pull from a later trade.
+
+### Browse member collections and card provenance
+
+- `GET /v1/groups/{groupId}/member-collections` returns card/copy/foil totals for every approved member.
+- `GET /v1/groups/{groupId}/members/{memberId}/collection?offset=0&limit=100` returns that member's card instances.
+- `GET /v1/groups/{groupId}/provenance?cardName=Great%20Olm` returns every current group-owned copy and its owner, foil state, original puller and pull time.
+
 ### Download missed activity
 
 `GET /v1/groups/{groupId}/sync?after=0&collectionVersion=0&limit=100`
@@ -122,4 +158,3 @@ Send no more than 500 names per request. The collection is grow-only.
 Store `nextCursor` and `collection.version` in the RuneLite profile. Continue
 while `hasMore` is true. The complete unlock list is returned only when the
 client collection version differs from the server version.
-
