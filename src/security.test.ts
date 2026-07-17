@@ -3,23 +3,16 @@ import {
   cardNameKey,
   normalizeCardName,
   normalizeInviteCode,
-  normalizeRsn,
+  privateMemberLabel,
   randomInviteCode,
   randomToken,
-  rsnKey,
   sha256,
 } from "./security";
 
-describe("RuneScape name handling", () => {
-  it("normalizes spaces and underscores", () => {
-    expect(normalizeRsn("  Sqwiglyy__HC  ")).toBe("Sqwiglyy HC");
-    expect(rsnKey("Sqwiglyy HC")).toBe("sqwiglyy hc");
-  });
-
-  it("rejects invalid names", () => {
-    expect(normalizeRsn(123)).toBeNull();
-    expect(normalizeRsn("this name is too long")).toBeNull();
-    expect(normalizeRsn("bad/name")).toBeNull();
+describe("private member labels", () => {
+  it("uses role and opaque server IDs rather than RuneScape names", () => {
+    expect(privateMemberLabel("owner", "ignored")).toBe("Owner");
+    expect(privateMemberLabel("member", "5e8b4bdf-1234-5678-90ab-abcdef123456")).toBe("Member 123456");
   });
 });
 
@@ -45,4 +38,3 @@ describe("credentials", () => {
     expect(await sha256("test")).toBe("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08");
   });
 });
-

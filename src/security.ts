@@ -1,19 +1,11 @@
 const INVITE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
-export function normalizeRsn(value: unknown): string | null {
-  if (typeof value !== "string") {
-    return null;
+export function privateMemberLabel(role: "owner" | "member", memberId: string): string {
+  if (role === "owner") {
+    return "Owner";
   }
-
-  const display = value.trim().replace(/[\s_\u00a0]+/g, " ");
-  if (display.length < 1 || display.length > 12 || !/^[A-Za-z0-9 -]+$/.test(display)) {
-    return null;
-  }
-  return display;
-}
-
-export function rsnKey(display: string): string {
-  return display.toLocaleLowerCase("en-US");
+  const suffix = memberId.replace(/[^A-Za-z0-9]/g, "").slice(-6).toUpperCase();
+  return `Member ${suffix || "PRIVATE"}`;
 }
 
 export function normalizeCardName(value: unknown): string | null {
@@ -74,4 +66,3 @@ function base64Url(bytes: Uint8Array): string {
   }
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
-

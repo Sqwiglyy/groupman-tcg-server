@@ -3,10 +3,9 @@ import {
   cardNameKey,
   normalizeCardName,
   normalizeInviteCode,
-  normalizeRsn,
+  privateMemberLabel,
   randomInviteCode,
   randomToken,
-  rsnKey,
   sha256,
 } from "./security";
 
@@ -17,7 +16,7 @@ interface Env {
 interface MemberRow {
   id: string;
   group_id: string;
-  rsn_display: string;
+  member_label: string;
   role: "owner" | "member";
   status: "pending" | "approved";
   revoked_at: number | null;
@@ -46,7 +45,7 @@ interface MemberCardInstanceInput {
   sourceInstanceId: string;
   cardName: string;
   foil: boolean;
-  pulledBy: string;
+  debug: boolean;
   pulledAt: number;
 }
 
@@ -77,7 +76,8 @@ export default {
       if (error instanceof ApiError) {
         return json({ error: { code: error.code, message: error.message } }, error.status);
       }
-      console.error("Unhandled API error", error);
+      // Do not place request bodies, credentials, identifiers, or gameplay data in Worker logs.
+      console.error("Unhandled Groupman TCG API error");
       return json({ error: { code: "internal_error", message: "The server could not complete the request." } }, 500);
     }
   },
@@ -89,7 +89,7 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   if (request.method === "GET" && path === "/health") {
     const database = await env.DB.prepare("SELECT 1 AS ok").first<{ ok: number }>();
-    return json({ status: database?.ok === 1 ? "ok" : "degraded", service: "groupman-tcg-api", version: 1 });
+    return json({ status: database?.ok === 1 ? "ok" : "degraded", service: "groupman-tcg-api", version: 2 });
   }
 
   if (request.method === "POST" && path === "/v1/groups") {
@@ -157,11 +157,15 @@ async function route(request: Request, env: Env): Promise<Response> {
 }
 
 async function createGroup(request: Request, env: Env): Promise<Response> {
-  const body = await readJson(request);
-  const groupName = stringField(body.groupName, "groupName", 1, 40);
-  const ownerRsn = requireRsn(body.ownerRsn);
+  await readJson(request);
+  const claimed = await env.DB.prepare("SELECT group_id FROM instance_registration WHERE slot = 1")
+    .first<{ group_id: string }>();
+  if (claimed) {
+    throw new ApiError(409, "instance_claimed", "This private server already belongs to a Groupman TCG group.");
+  }
   const groupId = crypto.randomUUID();
   const ownerId = crypto.randomUUID();
+  const ownerLabel = privateMemberLabel("owner", ownerId);
   const token = randomToken();
   const inviteCode = randomInviteCode();
   const now = Date.now();
@@ -172,18 +176,20 @@ async function createGroup(request: Request, env: Env): Promise<Response> {
       `INSERT INTO groups
        (id, display_name, owner_member_id, invite_hash, invite_expires_at, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(groupId, groupName, ownerId, await sha256(inviteCode), inviteExpiresAt, now, now),
+    ).bind(groupId, "Private Group", ownerId, await sha256(inviteCode), inviteExpiresAt, now, now),
     env.DB.prepare(
       `INSERT INTO members
-       (id, group_id, rsn_key, rsn_display, role, status, token_hash, created_at, approved_at, last_seen_at)
-       VALUES (?, ?, ?, ?, 'owner', 'approved', ?, ?, ?, ?)`,
-    ).bind(ownerId, groupId, rsnKey(ownerRsn), ownerRsn, await sha256(token), now, now, now),
+       (id, group_id, rsn_key, rsn_display, member_label, role, status, token_hash,
+        created_at, approved_at, last_seen_at)
+       VALUES (?, ?, ?, 'Private member', ?, 'owner', 'approved', ?, ?, ?, ?)`,
+    ).bind(ownerId, groupId, `private_${ownerId}`, ownerLabel, await sha256(token), now, now, now),
+    env.DB.prepare("INSERT INTO instance_registration (slot, group_id) VALUES (1, ?)").bind(groupId),
   ]);
 
   return json(
     {
-      group: { id: groupId, displayName: groupName, collectionVersion: 0 },
-      member: { id: ownerId, rsn: ownerRsn, role: "owner", status: "approved", token },
+      group: { id: groupId, collectionVersion: 0 },
+      member: { id: ownerId, label: ownerLabel, role: "owner", status: "approved", token },
       invite: { code: inviteCode, expiresAt: inviteExpiresAt },
     },
     201,
@@ -193,7 +199,6 @@ async function createGroup(request: Request, env: Env): Promise<Response> {
 async function joinGroup(request: Request, env: Env): Promise<Response> {
   const body = await readJson(request);
   const groupId = stringField(body.groupId, "groupId", 1, 64);
-  const rsn = requireRsn(body.rsn);
   const inviteCode = normalizeInviteCode(body.inviteCode);
   if (!inviteCode) {
     throw new ApiError(400, "invalid_invite", "inviteCode is not a valid group invite code.");
@@ -204,57 +209,38 @@ async function joinGroup(request: Request, env: Env): Promise<Response> {
     throw new ApiError(403, "invalid_invite", "The group invite is invalid or has expired.");
   }
 
-  const existing = await env.DB.prepare(
-    "SELECT id, role, status, revoked_at FROM members WHERE group_id = ? AND rsn_key = ?",
+  const active = await env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM members WHERE group_id = ? AND revoked_at IS NULL",
   )
-    .bind(groupId, rsnKey(rsn))
-    .first<{ id: string; role: string; status: string; revoked_at: number | null }>();
-  if (existing?.role === "owner" || (existing?.status === "approved" && existing.revoked_at === null)) {
-    throw new ApiError(409, "member_exists", "That RuneScape name is already an approved member.");
+    .bind(groupId)
+    .first<{ count: number }>();
+  if ((active?.count ?? 0) >= 5) {
+    throw new ApiError(409, "group_full", "This private group already has five active memberships.");
   }
 
-  if (!existing || existing.revoked_at !== null) {
-    const active = await env.DB.prepare(
-      "SELECT COUNT(*) AS count FROM members WHERE group_id = ? AND revoked_at IS NULL",
-    )
-      .bind(groupId)
-      .first<{ count: number }>();
-    if ((active?.count ?? 0) >= 5) {
-      throw new ApiError(409, "group_full", "A Group Ironman team can contain no more than five members.");
-    }
-  }
-
-  const memberId = existing?.id ?? crypto.randomUUID();
+  const memberId = crypto.randomUUID();
+  const memberLabel = privateMemberLabel("member", memberId);
   const token = randomToken();
   const tokenHash = await sha256(token);
   const now = Date.now();
 
-  if (existing) {
-    await env.DB.prepare(
-      `UPDATE members SET rsn_display = ?, status = 'pending', token_hash = ?,
-       revoked_at = NULL, approved_at = NULL, last_seen_at = ? WHERE id = ?`,
-    )
-      .bind(rsn, tokenHash, now, memberId)
-      .run();
-  } else {
-    await env.DB.prepare(
-      `INSERT INTO members
-       (id, group_id, rsn_key, rsn_display, role, status, token_hash, created_at, last_seen_at)
-       VALUES (?, ?, ?, ?, 'member', 'pending', ?, ?, ?)`,
-    )
-      .bind(memberId, groupId, rsnKey(rsn), rsn, tokenHash, now, now)
-      .run();
-  }
+  await env.DB.prepare(
+    `INSERT INTO members
+     (id, group_id, rsn_key, rsn_display, member_label, role, status, token_hash, created_at, last_seen_at)
+     VALUES (?, ?, ?, 'Private member', ?, 'member', 'pending', ?, ?, ?)`,
+  )
+    .bind(memberId, groupId, `private_${memberId}`, memberLabel, tokenHash, now, now)
+    .run();
 
-  return json({ member: { id: memberId, groupId, rsn, role: "member", status: "pending", token } }, 202);
+  return json({ member: { id: memberId, groupId, label: memberLabel, role: "member", status: "pending", token } }, 202);
 }
 
 async function getGroup(request: Request, env: Env, groupId: string): Promise<Response> {
   const member = await authenticate(request, env, groupId, true);
   const group = await getGroupRow(env, groupId);
   const members = await env.DB.prepare(
-    `SELECT id, rsn_display, role, status, created_at, approved_at, revoked_at, last_seen_at
-     FROM members WHERE group_id = ? ORDER BY role DESC, rsn_key`,
+    `SELECT id, member_label, role, status, created_at, approved_at, revoked_at, last_seen_at
+     FROM members WHERE group_id = ? ORDER BY role DESC, id`,
   )
     .bind(groupId)
     .all();
@@ -264,7 +250,7 @@ async function getGroup(request: Request, env: Env, groupId: string): Promise<Re
     currentMember: publicMember(member),
     members: members.results.map((row) => ({
       id: row.id,
-      rsn: row.rsn_display,
+      label: row.member_label,
       role: row.role,
       status: row.status,
       revoked: row.revoked_at !== null,
@@ -434,9 +420,9 @@ async function uploadMemberCollection(request: Request, env: Env, groupId: strin
       cardNameKey(instance.cardName),
       instance.cardName,
       instance.foil ? 1 : 0,
-      instance.pulledBy,
+      "",
       instance.pulledAt,
-      acquisitionKind(instance.pulledBy, instance.pulledAt),
+      acquisitionKind(instance.debug, instance.pulledAt),
       snapshotId,
       now,
     ]);
@@ -506,7 +492,7 @@ async function uploadMemberCollection(request: Request, env: Env, groupId: strin
 async function getMemberCollections(request: Request, env: Env, groupId: string): Promise<Response> {
   await authenticate(request, env, groupId, true);
   const result = await env.DB.prepare(
-    `SELECT m.id, m.rsn_display,
+    `SELECT m.id, m.member_label,
             COUNT(DISTINCT i.card_name_key) AS cards,
             COUNT(i.source_instance_id) AS copies,
             COALESCE(SUM(i.foil), 0) AS foils,
@@ -515,14 +501,14 @@ async function getMemberCollections(request: Request, env: Env, groupId: string)
      FROM members m
      LEFT JOIN member_card_instances i ON i.group_id = m.group_id AND i.member_id = m.id
      WHERE m.group_id = ? AND m.status = 'approved' AND m.revoked_at IS NULL
-     GROUP BY m.id, m.rsn_display ORDER BY m.rsn_key`,
+     GROUP BY m.id, m.member_label ORDER BY m.id`,
   )
     .bind(groupId)
     .all();
   return json({
     members: result.results.map((row) => ({
       id: row.id,
-      rsn: row.rsn_display,
+      label: row.member_label,
       cards: row.cards,
       copies: row.copies,
       foils: row.foils,
@@ -543,15 +529,15 @@ async function getMemberCollection(
   const limit = queryInteger(url, "limit", 1, 200, 100);
   const offset = queryInteger(url, "offset", 0, 100_000, 0);
   const owner = await env.DB.prepare(
-    "SELECT id, rsn_display FROM members WHERE id = ? AND group_id = ? AND status = 'approved' AND revoked_at IS NULL",
+    "SELECT id, member_label FROM members WHERE id = ? AND group_id = ? AND status = 'approved' AND revoked_at IS NULL",
   )
     .bind(memberId, groupId)
-    .first<{ id: string; rsn_display: string }>();
+    .first<{ id: string; member_label: string }>();
   if (!owner) {
     throw new ApiError(404, "member_not_found", "That approved group member does not exist.");
   }
   const result = await env.DB.prepare(
-    `SELECT source_instance_id, card_name, foil, pulled_by, pulled_at, acquisition_kind
+    `SELECT source_instance_id, card_name, foil, pulled_at, acquisition_kind
      FROM member_card_instances WHERE group_id = ? AND member_id = ?
      ORDER BY card_name_key, pulled_at, source_instance_id LIMIT ? OFFSET ?`,
   )
@@ -559,7 +545,7 @@ async function getMemberCollection(
     .all();
   const rows = result.results.slice(0, limit);
   return json({
-    member: { id: owner.id, rsn: owner.rsn_display },
+    member: { id: owner.id, label: owner.member_label },
     offset,
     nextOffset: offset + rows.length,
     hasMore: result.results.length > limit,
@@ -567,7 +553,6 @@ async function getMemberCollection(
       sourceInstanceId: row.source_instance_id,
       cardName: row.card_name,
       foil: row.foil === 1,
-      pulledBy: displayPulledBy(String(row.pulled_by)),
       pulledAt: row.pulled_at,
       acquisitionKind: row.acquisition_kind,
     })),
@@ -581,11 +566,11 @@ async function getCardProvenance(request: Request, env: Env, groupId: string, ur
     throw new ApiError(400, "invalid_card_name", "cardName is required.");
   }
   const result = await env.DB.prepare(
-    `SELECT i.source_instance_id, i.card_name, i.foil, i.pulled_by, i.pulled_at,
-            i.acquisition_kind, m.id AS member_id, m.rsn_display
+    `SELECT i.source_instance_id, i.card_name, i.foil, i.pulled_at,
+            i.acquisition_kind, m.id AS member_id, m.member_label
      FROM member_card_instances i JOIN members m ON m.id = i.member_id
      WHERE i.group_id = ? AND i.card_name_key = ? AND m.revoked_at IS NULL
-     ORDER BY i.pulled_at, m.rsn_key, i.source_instance_id`,
+     ORDER BY i.pulled_at, m.id, i.source_instance_id`,
   )
     .bind(groupId, cardNameKey(cardName))
     .all();
@@ -593,10 +578,9 @@ async function getCardProvenance(request: Request, env: Env, groupId: string, ur
     cardName,
     currentCopies: result.results.length,
     owners: result.results.map((row) => ({
-      member: { id: row.member_id, rsn: row.rsn_display },
+      member: { id: row.member_id, label: row.member_label },
       sourceInstanceId: row.source_instance_id,
       foil: row.foil === 1,
-      pulledBy: displayPulledBy(String(row.pulled_by)),
       pulledAt: row.pulled_at,
       acquisitionKind: row.acquisition_kind,
     })),
@@ -611,7 +595,7 @@ async function syncGroup(request: Request, env: Env, groupId: string, url: URL):
   const group = await getGroupRow(env, groupId);
   const result = await env.DB.prepare(
     `SELECT p.seq, p.event_id, p.opened_at, p.cards_json, p.created_at,
-            m.id AS member_id, m.rsn_display
+            m.id AS member_id, m.member_label
      FROM pack_events p JOIN members m ON m.id = p.member_id
      WHERE p.group_id = ? AND p.seq > ? ORDER BY p.seq LIMIT ?`,
   )
@@ -624,7 +608,7 @@ async function syncGroup(request: Request, env: Env, groupId: string, url: URL):
     eventId: row.event_id,
     openedAt: row.opened_at,
     receivedAt: row.created_at,
-    member: { id: row.member_id, rsn: row.rsn_display },
+    member: { id: row.member_id, label: row.member_label },
     cards: safeCardsJson(row.cards_json),
   }));
 
@@ -657,7 +641,7 @@ async function authenticate(request: Request, env: Env, groupId: string, require
     throw new ApiError(401, "unauthorized", "A valid member bearer token is required.");
   }
   const member = await env.DB.prepare(
-    `SELECT m.id, m.group_id, m.rsn_display, m.role, m.status, m.revoked_at, m.last_seen_at,
+    `SELECT m.id, m.group_id, m.member_label, m.role, m.status, m.revoked_at, m.last_seen_at,
             g.owner_member_id
      FROM members m JOIN groups g ON g.id = m.group_id
      WHERE m.token_hash = ? AND m.group_id = ? AND m.revoked_at IS NULL`,
@@ -727,23 +711,18 @@ function parseMemberCardInstance(value: unknown): MemberCardInstanceInput {
   if (typeof value.foil !== "boolean") {
     throw new ApiError(400, "invalid_foil", "foil must be a boolean.");
   }
-  const pulledBy = typeof value.pulledBy === "string" ? value.pulledBy.trim() : "";
-  if (pulledBy.length > 48 || /[\u0000-\u001f\u007f]/.test(pulledBy)) {
-    throw new ApiError(400, "invalid_pulled_by", "pulledBy must be no longer than 48 printable characters.");
+  if (typeof value.debug !== "boolean") {
+    throw new ApiError(400, "invalid_debug", "debug must be a boolean.");
   }
   const pulledAt = integerField(value.pulledAt, "pulledAt", 0, Date.now() + 10 * 60 * 1000);
-  return { sourceInstanceId, cardName, foil: value.foil, pulledBy, pulledAt };
+  return { sourceInstanceId, cardName, foil: value.foil, debug: value.debug, pulledAt };
 }
 
-function acquisitionKind(pulledBy: string, pulledAt: number): "debug" | "pack_or_trade" | "unknown" {
-  if (pulledBy.toUpperCase().startsWith("DEBUG_")) {
+function acquisitionKind(debug: boolean, pulledAt: number): "debug" | "pack_or_trade" | "unknown" {
+  if (debug) {
     return "debug";
   }
   return pulledAt > 0 ? "pack_or_trade" : "unknown";
-}
-
-function displayPulledBy(pulledBy: string): string {
-  return pulledBy.toUpperCase().startsWith("DEBUG_") ? `Debug_${pulledBy.slice(6)}` : pulledBy;
 }
 
 function uniqueCards(cards: CardPull[]): CardPull[] {
@@ -809,18 +788,9 @@ function queryInteger(url: URL, field: string, minimum: number, maximum: number,
   return number;
 }
 
-function requireRsn(value: unknown): string {
-  const rsn = normalizeRsn(value);
-  if (!rsn) {
-    throw new ApiError(400, "invalid_rsn", "The RuneScape name must be 1-12 letters, numbers, spaces or hyphens.");
-  }
-  return rsn;
-}
-
 function publicGroup(group: GroupRow) {
   return {
     id: group.id,
-    displayName: group.display_name,
     ownerMemberId: group.owner_member_id,
     collectionVersion: group.collection_version,
     inviteExpiresAt: group.invite_expires_at,
@@ -833,7 +803,7 @@ function publicMember(member: MemberRow) {
   return {
     id: member.id,
     groupId: member.group_id,
-    rsn: member.rsn_display,
+    label: member.member_label,
     role: member.role,
     status: member.status,
   };

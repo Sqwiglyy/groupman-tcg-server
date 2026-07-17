@@ -27,7 +27,7 @@
   "cloudflare": {
     "bindings": {
       "DB": {
-        "description": "D1 stores hosted groups, hashed member credentials, shared unlocks, card provenance, and pack history."
+        "description": "D1 stores one private group's opaque member labels, hashed credentials, shared TCG unlocks, card provenance, and pack history."
       }
     }
   }
