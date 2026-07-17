@@ -11,6 +11,7 @@ Production API: `https://groupman-tcg-api.sqwiglyy.workers.dev`
 - A group owner creates a group and receives an owner token plus a 30-day invite.
 - New members join as pending and receive an individual token.
 - Only the owner can approve or revoke members.
+- Hosted groups are capped at the five members supported by Group Ironman.
 - Tokens and invite codes are stored in D1 only as SHA-256 hashes.
 - The RuneLite client must never contain a shared administrative secret.
 - This is an honour-mode service. It cannot prove ownership of a RuneScape name.

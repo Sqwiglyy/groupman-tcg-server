@@ -213,6 +213,17 @@ async function joinGroup(request: Request, env: Env): Promise<Response> {
     throw new ApiError(409, "member_exists", "That RuneScape name is already an approved member.");
   }
 
+  if (!existing || existing.revoked_at !== null) {
+    const active = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM members WHERE group_id = ? AND revoked_at IS NULL",
+    )
+      .bind(groupId)
+      .first<{ count: number }>();
+    if ((active?.count ?? 0) >= 5) {
+      throw new ApiError(409, "group_full", "A Group Ironman team can contain no more than five members.");
+    }
+  }
+
   const memberId = existing?.id ?? crypto.randomUUID();
   const token = randomToken();
   const tokenHash = await sha256(token);
