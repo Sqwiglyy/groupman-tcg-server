@@ -1,20 +1,18 @@
-# Security and private reports
+# Security reports
 
-Do not publish Group TCG setup keys, group IDs, invite codes, bearer tokens,
-Worker URLs, D1 database IDs, database exports, or logs containing request data
-in an issue.
+Use GitHub's **Security** tab to report a leaked credential, privacy problem, or
+authentication bypass privately. Replace real names, URLs, IDs, and credentials
+with examples.
 
-Report a suspected credential exposure, privacy problem, or authentication
-bypass privately through this repository's **Security** tab by opening a
-private vulnerability report. Replace personal and deployment-specific values
-with examples wherever possible.
+Do not post these in a public issue:
 
-If an invite is exposed, rotate it from the owner client. If a member token is
-exposed, revoke that member and let them rejoin. If an owner token or database
-export is exposed, take the Worker offline, preserve a private backup, and
-replace the deployment before inviting members again.
+- setup keys, group IDs, invites, or member tokens;
+- Worker URLs or D1 database IDs;
+- database exports, logs, or screenshots containing private data.
 
-If an unused Worker's setup key is exposed, replace the encrypted Cloudflare
-`SETUP_KEY` secret before creating its group. The key is no longer accepted
-after that Worker has been claimed, but should still be removed from any place
-where it was disclosed.
+If an invite leaks, create a new one from the host's RuneLite client. If a
+member token leaks, remove that member and let them join again.
+
+If the host token or a database export leaks, take the Worker offline and move
+the group to a new deployment. If an unused setup key leaks, replace the
+encrypted `SETUP_KEY` secret before creating the group.
