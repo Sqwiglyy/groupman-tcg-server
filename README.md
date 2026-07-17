@@ -117,6 +117,29 @@ Keep exports private: they contain RuneScape display names, card history, and
 hashed credentials. Deleting the Worker does not necessarily delete its D1
 database; remove both from the Cloudflare dashboard when retiring a server.
 
+### Troubleshooting
+
+- **`/health` works but group actions return database errors:** run
+  `pnpm db:migrate:remote`, then deploy again. A new D1 database has no tables
+  until both migrations have been applied.
+- **Wrangler cannot find the `DB` binding:** confirm `wrangler.jsonc` contains a
+  D1 entry whose binding is exactly `DB`. For a manual first deployment, rerun
+  `pnpm wrangler d1 create groupman-tcg --binding DB --update-config`.
+- **The plugin rejects the server URL:** use the Worker root URL beginning with
+  `https://`; do not include `/health`, another path, query parameters, or login
+  details. Plain HTTP is accepted only for local development.
+- **One teammate cannot join:** every teammate must select the same backend
+  before creating or joining. A group ID and invite from one deployment do not
+  exist in another deployment.
+- **A member remains pending:** the hosted owner must approve that RuneScape
+  name, and the plugin will offer approval only when the name is on the official
+  in-game Group Ironman roster.
+- **Changing the URL does not move an existing group:** disconnect that hosted
+  profile, select the new URL, and create or join a group on the new server.
+  Collection data is not automatically copied between D1 databases.
+- **A deployment build fails:** use Node.js 20 or newer, rerun `pnpm install`
+  and `pnpm check`, then inspect live Worker logs with `pnpm wrangler tail`.
+
 ## Local development
 
 Requires Node.js 20 or newer.
