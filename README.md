@@ -6,6 +6,11 @@ instant reveals; this API makes every approved member converge after reconnectin
 
 Production API: `https://groupman-tcg-api.sqwiglyy.workers.dev`
 
+The RuneLite plugin uses that public service by default. A group may instead
+deploy this repository to one teammate's Cloudflare account and enter the
+resulting Worker URL in **Hosted server URL**. Every member of a group must use
+the same server; groups and credentials do not cross between deployments.
+
 ## Security model
 
 - A group owner creates a group and receives an owner token plus a 30-day invite.
@@ -19,6 +24,98 @@ Production API: `https://groupman-tcg-api.sqwiglyy.workers.dev`
 Keep member tokens private. They are returned only when a group is created or a
 member joins. A revoked member can rejoin with a valid invite and receives a new
 token, but must be approved again.
+
+## Data and operator responsibilities
+
+Each deployment stores group/member IDs, RuneScape display names, hashed bearer
+tokens and invite codes, card instance IDs and names, foil/original-puller/time
+metadata, shared unlocks, and pack events. It does not receive Jagex passwords,
+bank PINs, session tokens, chat, or general gameplay telemetry from the plugin.
+The application does not deliberately store client IP addresses, although
+Cloudflare may process connection metadata under the account's Cloudflare
+settings and policies.
+
+Data currently remains in D1 until the server operator removes it or deletes
+the database. A self-hosting operator is responsible for access to the
+Cloudflare account, backups, applicable privacy notices, and responding to
+their group's deletion requests. The API is an honour-mode coordination service
+and cannot independently prove that a RuneScape display name belongs to the
+caller.
+
+## Deploy your own Cloudflare server
+
+This repository is a reusable Worker + D1 template. The checked-in
+`wrangler.jsonc` deliberately contains no Sqwiglyy account or database ID.
+Cloudflare creates a separate database in the deploying user's account.
+
+### One-click template
+
+Cloudflare can clone a public GitHub repository, provision the Worker and D1
+binding, apply the migrations through `pnpm deploy`, and deploy it. Once this
+repository has been published, replace `YOUR_GITHUB_NAME` below with its owner
+and put this badge near the top of the README:
+
+```markdown
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/YOUR_GITHUB_NAME/groupman-tcg-server)
+```
+
+The group owner then:
+
+1. Clicks **Deploy to Cloudflare** and signs into Cloudflare and GitHub.
+2. Accepts the generated Worker and D1 names and waits for the build to finish.
+3. Opens `https://THEIR-WORKER.workers.dev/health` and confirms it returns
+   `{"status":"ok"}`.
+4. Copies the Worker root URL, without `/health`.
+5. Every teammate enters that identical URL in RuneLite under
+   **Groupman TCG → Collection → Hosted server URL** before creating or joining
+   the hosted group.
+
+Never share the owner or member bearer tokens. Teammates share only the group
+ID and invite code produced inside the RuneLite sidebar.
+
+### Manual deployment
+
+Requires a Cloudflare account, Node.js 20 or newer, and pnpm.
+
+```powershell
+pnpm install
+pnpm wrangler login
+pnpm wrangler d1 create groupman-tcg --binding DB --update-config
+pnpm deploy
+```
+
+The D1 command writes the new database ID into that fork's `wrangler.jsonc`.
+`pnpm deploy` applies every unapplied migration and then deploys the Worker.
+Copy the `https://...workers.dev` URL printed at the end and verify `/health`.
+
+For an existing deployment whose account-specific configuration should remain
+uncommitted, copy `wrangler.jsonc` to the ignored `wrangler.local.jsonc`, add
+its D1 database ID, and use:
+
+```powershell
+pnpm deploy:production
+```
+
+### Updates and backups
+
+Before deploying an update, run:
+
+```powershell
+pnpm install
+pnpm check
+pnpm deploy
+```
+
+Cloudflare retains D1 data independently of the Worker code. Export a manual
+backup before schema changes with:
+
+```powershell
+pnpm wrangler d1 export DB --remote --output groupman-tcg-backup.sql
+```
+
+Keep exports private: they contain RuneScape display names, card history, and
+hashed credentials. Deleting the Worker does not necessarily delete its D1
+database; remove both from the Cloudflare dashboard when retiring a server.
 
 ## Local development
 
@@ -37,15 +134,6 @@ Run all local checks with:
 ```powershell
 pnpm check
 ```
-
-## Deploying to Cloudflare
-
-1. Authenticate: `pnpm wrangler login`
-2. Create D1: `pnpm wrangler d1 create groupman-tcg`
-3. Replace the placeholder `database_id` in `wrangler.jsonc` with the returned ID.
-4. Apply the production migration: `pnpm db:migrate:remote`
-5. Deploy: `pnpm deploy`
-6. Verify the returned URL at `/health`.
 
 Do not commit `.dev.vars`, `.env`, tokens, invite codes or exported production data.
 

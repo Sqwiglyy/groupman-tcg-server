@@ -11,7 +11,6 @@
     {
       "binding": "DB",
       "database_name": "groupman-tcg",
-      "database_id": "e24aacb2-50b7-47d8-99fd-5f28aed51617",
       "migrations_dir": "migrations"
     }
   ]
