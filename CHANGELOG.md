@@ -1,10 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- Simplify deployment, privacy, backup, and troubleshooting guidance.
-- Refresh the repository name and public wording.
-
 ## 0.1.0 - 2026-07-17
 
 - Add a private Cloudflare Worker and D1 server for one Group TCG group.
