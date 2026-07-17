@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "groupman-tcg-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-17",
+  "workers_dev": true,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "groupman-tcg",
+      "migrations_dir": "migrations"
+    }
+  ]
+}
