@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Include the approved opener display name and server receipt timestamp in pack
+  sync events so clients can schedule correctly attributed delayed previews.
+
 ## v0.1.0-rc.3 - 2026-07-17
 
 - Rename the service documentation to Group TCG API v4.

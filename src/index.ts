@@ -669,7 +669,7 @@ async function syncGroup(request: Request, env: Env, groupId: string, url: URL):
   const group = await getGroupRow(env, groupId);
   const result = await env.DB.prepare(
     `SELECT p.seq, p.event_id, p.opened_at, p.cards_json, p.created_at,
-            m.id AS member_id, m.member_label
+            m.id AS member_id, m.member_label, m.player_name
      FROM pack_events p JOIN members m ON m.id = p.member_id
      WHERE p.group_id = ? AND p.seq > ? ORDER BY p.seq LIMIT ?`,
   )
@@ -682,7 +682,7 @@ async function syncGroup(request: Request, env: Env, groupId: string, url: URL):
     eventId: row.event_id,
     openedAt: row.opened_at,
     receivedAt: row.created_at,
-    member: { id: row.member_id, label: row.member_label },
+    member: { id: row.member_id, label: row.member_label, playerName: row.player_name },
     cards: safeCardsJson(row.cards_json),
   }));
 
