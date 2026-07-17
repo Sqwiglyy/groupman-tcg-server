@@ -1,5 +1,7 @@
 # Groupman TCG Server
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Sqwiglyy/groupman-tcg-server)
+
 Cloudflare Worker and D1 database used by the Groupman TCG RuneLite plugin for
 durable group unlocks and offline pack history. RuneLite Party can still carry
 instant reveals; this API makes every approved member converge after reconnecting.
@@ -50,14 +52,9 @@ Cloudflare creates a separate database in the deploying user's account.
 
 ### One-click template
 
-Cloudflare can clone a public GitHub repository, provision the Worker and D1
-binding, apply the migrations through `pnpm deploy`, and deploy it. Once this
-repository has been published, replace `YOUR_GITHUB_NAME` below with its owner
-and put this badge near the top of the README:
-
-```markdown
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/YOUR_GITHUB_NAME/groupman-tcg-server)
-```
+Click the **Deploy to Cloudflare** button at the top of this README. Cloudflare
+will clone this public repository, provision the Worker and D1 binding, apply
+the migrations through `pnpm deploy`, and deploy it.
 
 The group owner then:
 
