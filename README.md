@@ -35,6 +35,10 @@ and Worker observability is not enabled by the template. Cloudflare still
 processes connection metadata such as IP addresses at its edge under the
 self-hosting account's settings and policies.
 
+The private setup key is received only in the first group-creation request. It
+is configured as an encrypted Cloudflare Worker secret, is never written to
+D1, and is never stored by the RuneLite plugin. Group members do not need it.
+
 Migration `0003_private_members.sql` irreversibly replaces any legacy
 RuneScape/original-puller labels in an existing D1 database with private member
 labels and blank values. Back up the database before updating if the operator
@@ -43,8 +47,9 @@ the migration.
 
 ## Security model
 
-- The first successful group creation claims the deployment's single group
-  slot. Another group cannot register on that Worker.
+- A private encrypted setup key protects the first group creation. The first
+  successful creation then permanently claims the deployment's single group
+  slot, so another group cannot register on that Worker.
 - The owner receives an individual bearer token and a 30-day invite code.
 - A joining client receives a separate token and remains pending.
 - The owner confirms the joining member's private label out of band, then
@@ -65,18 +70,25 @@ ownership of an in-game character because no RuneScape identity is uploaded.
 2. Sign into Cloudflare and GitHub when asked.
 3. Accept the generated Worker and D1 names and wait for the deployment build.
    The `pnpm deploy` command applies every pending migration before deploying.
-4. Open `https://YOUR-WORKER.workers.dev/health` and confirm a response similar
-   to `{"status":"ok","service":"groupman-tcg-api","version":2}`.
-5. Copy only the root `https://YOUR-WORKER.workers.dev` URL.
-6. Every teammate opens RuneLite settings for **Groupman TCG**, enables
+4. Generate a unique random setup key of at least 16 characters (32 or more is
+   recommended) and save it privately in a password manager. In the Worker's
+   Cloudflare settings, add an **encrypted secret** named exactly `SETUP_KEY`
+   with that value, then deploy the secret change. Never put the value in
+   `wrangler.jsonc`, GitHub, chat, screenshots, or the invite message.
+5. Open `https://YOUR-WORKER.workers.dev/health` and confirm a response similar
+   to `{"status":"ok","service":"groupman-tcg-api","version":3,"setupReady":true}`.
+6. Copy only the root `https://YOUR-WORKER.workers.dev` URL.
+7. Every teammate opens RuneLite settings for **Groupman TCG**, enables
    **Hosted offline sync**, and pastes that identical root URL into
    **Hosted server URL**.
-7. The owner logs into their GIM/HCGIM character and selects **Create hosted
-   group** in the plugin sidebar.
-8. The owner privately shares the displayed group ID and invite code.
-9. Each teammate selects **Join hosted group**, then tells the owner their
+8. The owner logs into their GIM/HCGIM character, selects **Create hosted
+   group** in the plugin sidebar, and enters the setup key once. The plugin
+   sends it only to that Worker over HTTPS and does not save it.
+9. The owner privately shares the displayed group ID and invite code, not the
+   setup key.
+10. Each teammate selects **Join hosted group**, then tells the owner their
    assigned private label such as `Member A1B2C3`.
-10. The owner approves only the expected label. Repeat for the remaining team.
+11. The owner approves only the expected label. Repeat for the remaining team.
 
 Never publish the group ID/invite pair. Never share an owner/member bearer
 token. The RuneLite plugin stores its token in the associated local RuneLite
@@ -90,9 +102,15 @@ Requires a Cloudflare account, Node.js 22 or newer, and pnpm:
 pnpm install
 pnpm wrangler login
 pnpm wrangler d1 create groupman-tcg --binding DB --update-config
+pnpm wrangler secret put SETUP_KEY
 pnpm check
 pnpm deploy
 ```
+
+At the `secret put` prompt, enter a unique random value of at least 16
+characters. Wrangler stores it as an encrypted Worker secret; do not add it to
+the repository. Save it privately until the owner has created the group. Other
+members never need it.
 
 The D1 creation command writes that deployment's database ID into
 `wrangler.jsonc`. Remove that account-specific ID before publishing a reusable
@@ -110,17 +128,21 @@ pnpm deploy:production
 
 That command also applies migrations first.
 
-### Upgrade an existing pre-privacy deployment
+### Upgrade an existing deployment
 
-The v2 protocol removes fields that older plugin builds expected. Coordinate
-the update rather than deploying it mid-session:
+The v2 protocol removed fields that older plugin builds expected. API v3 adds
+setup-key protection for unclaimed Workers without changing established member
+sync. Coordinate an update rather than deploying it mid-session:
 
 1. Update every teammate to the matching Groupman TCG privacy build.
 2. Ask the group to close RuneLite or disable hosted sync temporarily.
 3. Export a private D1 backup.
-4. Run `pnpm check`, then `pnpm deploy` or `pnpm deploy:production`.
-5. Confirm `/health` reports version `2` and allow each client to sync again.
-6. Confirm members now appear only as `Owner` or `Member XXXXXX`.
+4. If this Worker has not created its group yet, configure the encrypted
+   `SETUP_KEY` secret before continuing. An already claimed Worker does not
+   require the key for normal group operations.
+5. Run `pnpm check`, then `pnpm deploy` or `pnpm deploy:production`.
+6. Confirm `/health` reports version `3` and allow each client to sync again.
+7. Confirm members now appear only as `Owner` or `Member XXXXXX`.
 
 Migration 0003 redacts legacy RuneScape and original-puller labels. That
 redaction is intentional and cannot be reversed without restoring the private
@@ -143,7 +165,9 @@ command and use `pnpm deploy:production`.
 Cloudflare retains D1 independently of Worker code. Deleting the Worker does
 not necessarily delete D1. When retiring a group, delete both resources and
 any private exports. Never commit `.dev.vars`, `.env`, bearer tokens, invite
-codes, D1 database IDs, logs, or exported data.
+codes, D1 database IDs, setup keys, logs, or exported data. Encrypted Worker
+secrets persist separately from code deployments; rotate `SETUP_KEY` with
+`wrangler secret put` if it is exposed before the Worker is claimed.
 
 ## Privacy requests and deletion
 
@@ -161,6 +185,13 @@ to delete their D1 rows directly or retire the whole private deployment.
 
 - **`/health` returns a database error:** run `pnpm db:migrate:remote`, or
   `pnpm db:migrate:production` when using `wrangler.local.jsonc`.
+- **`/health` shows `setupReady:false`:** add an encrypted Worker secret named
+  exactly `SETUP_KEY` with a random value of at least 16 characters, deploy the
+  secret change, and refresh `/health`.
+- **Create says `setup_not_configured`:** the Worker has no valid setup secret;
+  configure `SETUP_KEY` and try again.
+- **Create says `invalid_setup_key`:** the owner entered a different value from
+  the Worker's `SETUP_KEY`. Re-enter the saved key; do not send it to members.
 - **The Worker says `instance_claimed`:** this deployment already belongs to a
   group. Use its existing owner/invite flow or deploy a separate Worker.
 - **A member remains pending:** confirm their private `Member XXXXXX` label
@@ -205,9 +236,14 @@ Create the deployment's one group:
 ```http
 POST /v1/groups
 Content-Type: application/json
+X-Groupman-Setup-Key: PRIVATE_SETUP_KEY
 
 {}
 ```
+
+This header is required only for the first group creation. The Worker rejects
+creation when the encrypted `SETUP_KEY` secret is missing or does not match,
+and rejects further creation attempts after its group slot is claimed.
 
 Request a pending membership without a RuneScape identity:
 

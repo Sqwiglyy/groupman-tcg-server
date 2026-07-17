@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.0-rc.2 - 2026-07-17
+
+- Require a private encrypted `SETUP_KEY` before an unclaimed Worker can create
+  its single group.
+- Report setup readiness without disclosing the key through API v3 health
+  responses.
+- Document one-time owner setup, key rotation, and first-claim troubleshooting.
+
 ## v0.1.0-rc.1 - 2026-07-17
 
 - Added the private, self-hosted Cloudflare Worker and D1 API for Groupman TCG.

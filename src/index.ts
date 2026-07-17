@@ -11,6 +11,7 @@ import {
 
 interface Env {
   DB: D1Database;
+  SETUP_KEY?: string;
 }
 
 interface MemberRow {
@@ -67,6 +68,8 @@ const JSON_HEADERS = {
 
 const INVITE_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_BODY_BYTES = 64 * 1024;
+const MIN_SETUP_KEY_LENGTH = 16;
+const MAX_SETUP_KEY_LENGTH = 256;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -89,7 +92,12 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   if (request.method === "GET" && path === "/health") {
     const database = await env.DB.prepare("SELECT 1 AS ok").first<{ ok: number }>();
-    return json({ status: database?.ok === 1 ? "ok" : "degraded", service: "groupman-tcg-api", version: 2 });
+    return json({
+      status: database?.ok === 1 ? "ok" : "degraded",
+      service: "groupman-tcg-api",
+      version: 3,
+      setupReady: validSetupKey(configuredSetupKey(env)),
+    });
   }
 
   if (request.method === "POST" && path === "/v1/groups") {
@@ -157,12 +165,23 @@ async function route(request: Request, env: Env): Promise<Response> {
 }
 
 async function createGroup(request: Request, env: Env): Promise<Response> {
-  await readJson(request);
   const claimed = await env.DB.prepare("SELECT group_id FROM instance_registration WHERE slot = 1")
     .first<{ group_id: string }>();
   if (claimed) {
     throw new ApiError(409, "instance_claimed", "This private server already belongs to a Groupman TCG group.");
   }
+
+  const expectedSetupKey = configuredSetupKey(env);
+  if (!validSetupKey(expectedSetupKey)) {
+    throw new ApiError(503, "setup_not_configured", "The Worker owner must configure its private setup key first.");
+  }
+  const suppliedSetupKey = (request.headers.get("X-Groupman-Setup-Key") ?? "").trim();
+  if (suppliedSetupKey.length < MIN_SETUP_KEY_LENGTH || suppliedSetupKey.length > MAX_SETUP_KEY_LENGTH
+    || (await sha256(suppliedSetupKey)) !== (await sha256(expectedSetupKey))) {
+    throw new ApiError(403, "invalid_setup_key", "The private Worker setup key is incorrect.");
+  }
+
+  await readJson(request);
   const groupId = crypto.randomUUID();
   const ownerId = crypto.randomUUID();
   const ownerLabel = privateMemberLabel("owner", ownerId);
@@ -194,6 +213,14 @@ async function createGroup(request: Request, env: Env): Promise<Response> {
     },
     201,
   );
+}
+
+function configuredSetupKey(env: Env): string {
+  return (env.SETUP_KEY ?? "").trim();
+}
+
+function validSetupKey(value: string): boolean {
+  return value.length >= MIN_SETUP_KEY_LENGTH && value.length <= MAX_SETUP_KEY_LENGTH;
 }
 
 async function joinGroup(request: Request, env: Env): Promise<Response> {
